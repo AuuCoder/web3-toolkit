@@ -61,7 +61,7 @@ cp .env.example .env
 3. 编辑 `.env` 文件，填入您的 USER_TOKEN：
 
 ```bash
-# 从 https://www.nocaptcha.io/ 获取的 USER_TOKEN
+# 从 https://www.nocaptcha.io/register?c=P4QdvE 获取的 USER_TOKEN
 USER_TOKEN=your_nocaptcha_token
 ```
 
