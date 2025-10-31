@@ -228,7 +228,7 @@ python opn-claim.py
 
 ### USER_TOKEN
 
-从 [nocaptcha.io](https://www.nocaptcha.io/) 获取的用户 TOKEN，用于破解 reCAPTCHA。
+从 [nocaptcha.io](https://www.nocaptcha.io/register?c=P4QdvE) 获取的用户 TOKEN，用于破解 reCAPTCHA。
 
 **使用范围**：仅 opn-faucet.py 需要
 
