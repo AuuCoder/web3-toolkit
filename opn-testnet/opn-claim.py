@@ -5,6 +5,7 @@ OPN 测试网 Claim 操作脚本
 - 批量读取私钥
 - 连接 OPN 测试网
 - 调用合约执行 claim 操作
+- 多线程并发处理
 - 自动重试机制（最多3次）
 - 保存执行结果
 """
@@ -12,6 +13,9 @@ OPN 测试网 Claim 操作脚本
 import os
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from common.config_loader import ConfigLoader
 from web3 import Web3  # pyright: ignore[reportMissingImports]
 from eth_account import Account  # pyright: ignore[reportMissingImports]
 
@@ -24,6 +28,12 @@ CLAIM_DATA = "0x4e71d92d"
 
 # 指定当前项目目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 加载配置
+config = ConfigLoader(current_dir)\
+            .load_env(keys=['MAX_WORKERS'])
+
+MAX_WORKERS = int(config.get('MAX_WORKERS', 3))  # 默认3个线程（claim比较慢）
 
 # 连接到 OPN 测试网
 print("🔗 连接到 OPN 测试网...")
@@ -67,6 +77,7 @@ for idx, private_key in enumerate(private_keys, 1):
         continue
 
 print(f"\n📋 成功加载 {len(accounts)} 个钱包")
+print(f"🧵 线程数: {MAX_WORKERS}")
 print("=" * 70)
 
 # 统计信息
@@ -74,13 +85,25 @@ success_count = 0
 failed_count = 0
 results = []
 
+# 线程锁，用于保护共享变量
+stats_lock = threading.Lock()
+results_lock = threading.Lock()
+print_lock = threading.Lock()
 
-def execute_claim(account_info, attempt=1):
+def thread_print(msg):
+    """线程安全的打印函数"""
+    with print_lock:
+        print(msg)
+
+
+def execute_claim(account_info, idx, total, attempt=1):
     """
     执行 claim 操作
     
     Args:
         account_info: 账户信息
+        idx: 钱包编号
+        total: 总钱包数
         attempt: 当前尝试次数
     
     Returns:
@@ -116,7 +139,7 @@ def execute_claim(account_info, attempt=1):
             estimated_gas = w3.eth.estimate_gas(transaction)
             transaction['gas'] = int(estimated_gas * 1.2)  # 增加 20% 作为缓冲
         except Exception as e:
-            print(f"    ⚠️  Gas 估算失败，使用默认值: {str(e)}")
+            thread_print(f"[{idx}/{total}] ⚠️  Gas 估算失败，使用默认值: {str(e)}")
         
         # 签名交易
         signed_txn = account.sign_transaction(transaction)
@@ -125,11 +148,11 @@ def execute_claim(account_info, attempt=1):
         tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
         tx_hash_hex = tx_hash.hex()
         
-        print(f"    📤 交易已发送: {tx_hash_hex}")
-        print(f"    🔍 查看交易: {EXPLORER_URL}/tx/{tx_hash_hex}")
+        thread_print(f"[{idx}/{total}] 📤 交易已发送: {tx_hash_hex}")
+        thread_print(f"[{idx}/{total}] 🔍 查看交易: {EXPLORER_URL}/tx/{tx_hash_hex}")
         
         # 等待交易确认
-        print(f"    ⏳ 等待交易确认...")
+        thread_print(f"[{idx}/{total}] ⏳ 等待交易确认...")
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         
         if receipt['status'] == 1:
@@ -141,74 +164,103 @@ def execute_claim(account_info, attempt=1):
         return False, None, str(e)
 
 
-# 遍历所有账户
-for idx, account_info in enumerate(accounts, 1):
+def process_account(idx, account_info, total):
+    """处理单个账户的claim任务"""
+    global success_count, failed_count
+    
     address = account_info['address']
     balance = account_info['balance']
     
-    print(f"\n[{idx}/{len(accounts)}] 处理钱包: {address}")
-    print(f"    💰 余额: {balance:.6f} OPN")
-    print("-" * 70)
+    thread_print(f"\n[{idx}/{total}] 🚀 开始处理: {address}")
+    thread_print(f"[{idx}/{total}] 💰 余额: {balance:.6f} OPN")
     
     # 检查余额是否足够
     if balance < 0.0001:
-        print(f"    ❌ 余额不足，跳过")
-        failed_count += 1
-        results.append({
-            "address": address,
-            "private_key": account_info['private_key'],
-            "status": "failed",
-            "error": "余额不足"
-        })
-        continue
+        thread_print(f"[{idx}/{total}] ❌ 余额不足，跳过")
+        with stats_lock:
+            failed_count += 1
+        with results_lock:
+            results.append({
+                "address": address,
+                "private_key": account_info['private_key'],
+                "status": "failed",
+                "error": "余额不足"
+            })
+        return address
     
     max_retries = 3
     claim_success = False
     
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
-            print(f"\n    🔄 第 {attempt} 次重试...")
+            thread_print(f"[{idx}/{total}] 🔄 第 {attempt} 次重试...")
             time.sleep(3)  # 重试前等待3秒
         
-        print(f"    🔄 执行 claim 操作...")
-        success, tx_hash, error_msg = execute_claim(account_info, attempt)
+        thread_print(f"[{idx}/{total}] 🔄 执行 claim 操作...")
+        success, tx_hash, error_msg = execute_claim(account_info, idx, total, attempt)
         
         if success:
-            print(f"    ✅ Claim 成功!")
-            print(f"    📝 交易哈希: {tx_hash}")
-            success_count += 1
-            results.append({
-                "address": address,
-                "private_key": account_info['private_key'],
-                "status": "success",
-                "attempts": attempt,
-                "tx_hash": tx_hash,
-                "explorer_url": f"{EXPLORER_URL}/tx/{tx_hash}"
-            })
-            claim_success = True
-            break
-        else:
-            print(f"    ❌ Claim 失败: {error_msg}")
+            thread_print(f"[{idx}/{total}] ✅ Claim 成功! {address}")
+            thread_print(f"[{idx}/{total}] 📝 交易哈希: {tx_hash}")
             
-            if attempt < max_retries:
-                print(f"    ⏳ 将在 {max_retries - attempt} 次机会中重试...")
-            else:
-                print(f"    ❌ 已达到最大重试次数 ({max_retries} 次)，放弃该地址")
-                failed_count += 1
+            with stats_lock:
+                success_count += 1
+            with results_lock:
                 results.append({
                     "address": address,
                     "private_key": account_info['private_key'],
-                    "status": "failed",
+                    "status": "success",
                     "attempts": attempt,
-                    "error": error_msg,
-                    "tx_hash": tx_hash if tx_hash else None
+                    "tx_hash": tx_hash,
+                    "explorer_url": f"{EXPLORER_URL}/tx/{tx_hash}"
                 })
+            claim_success = True
+            break
+        else:
+            thread_print(f"[{idx}/{total}] ❌ Claim 失败: {error_msg}")
+            
+            if attempt < max_retries:
+                thread_print(f"[{idx}/{total}] ⏳ 将重试...")
+            else:
+                thread_print(f"[{idx}/{total}] ❌ 已达到最大重试次数，放弃该地址")
+                
+                with stats_lock:
+                    failed_count += 1
+                with results_lock:
+                    results.append({
+                        "address": address,
+                        "private_key": account_info['private_key'],
+                        "status": "failed",
+                        "attempts": attempt,
+                        "error": error_msg,
+                        "tx_hash": tx_hash if tx_hash else None
+                    })
     
-    # 如果不是最后一个地址，等待一段时间避免请求过快
-    if idx < len(accounts):
-        wait_time = 5
-        print(f"\n    ⏳ 等待 {wait_time} 秒后处理下一个地址...")
-        time.sleep(wait_time)
+    return address
+
+# 使用线程池处理所有账户
+print("\n🚀 开始批量处理账户...")
+start_time = time.time()
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # 提交所有任务
+    futures = {
+        executor.submit(process_account, idx, account_info, len(accounts)): (idx, account_info) 
+        for idx, account_info in enumerate(accounts, 1)
+    }
+    
+    # 等待所有任务完成
+    completed = 0
+    for future in as_completed(futures):
+        completed += 1
+        try:
+            address = future.result()
+            thread_print(f"\n✅ 进度: {completed}/{len(accounts)} 已完成")
+        except Exception as e:
+            thread_print(f"\n❌ 任务执行异常: {str(e)}")
+
+end_time = time.time()
+elapsed_time = end_time - start_time
 
 # 输出统计信息
 print("\n" + "=" * 70)
@@ -217,6 +269,10 @@ print("=" * 70)
 print(f"✅ 成功: {success_count} 个")
 print(f"❌ 失败: {failed_count} 个")
 print(f"📝 总计: {len(accounts)} 个")
+print(f"⏱️  总耗时: {elapsed_time:.2f} 秒")
+print(f"🧵 使用线程数: {MAX_WORKERS}")
+if len(accounts) > 0:
+    print(f"⚡ 平均速度: {elapsed_time/len(accounts):.2f} 秒/个")
 
 # 保存结果到文件
 result_file = os.path.join(current_dir, 'claim_results.json')

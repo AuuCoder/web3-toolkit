@@ -3,6 +3,8 @@ import os
 import requests  # pyright: ignore[reportMissingModuleSource]
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pynocaptcha import ReCaptchaUniversalCracker, ReCaptchaEnterpriseCracker, ReCaptchaSteamCracker  # pyright: ignore[reportMissingImports]
 from eth_account import Account  # pyright: ignore[reportMissingImports]
 
@@ -10,9 +12,11 @@ from eth_account import Account  # pyright: ignore[reportMissingImports]
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 config = ConfigLoader(current_dir)\
-            .load_env(keys=['USER_TOKEN'])
+            .load_env(keys=['USER_TOKEN', 'PROXY_API', 'MAX_WORKERS'])
 
 USER_TOKEN = config.get('USER_TOKEN')
+PROXY_API = config.get('PROXY_API')
+MAX_WORKERS = int(config.get('MAX_WORKERS', 5))  # 默认5个线程
 
 # 读取私钥列表
 wallet_file = os.path.join(current_dir, 'wallet.json')
@@ -40,12 +44,51 @@ for idx, private_key in enumerate(private_keys, 1):
         continue
 
 print(f"\n📋 成功转换 {len(wallet_addresses)} 个钱包地址")
+print(f"🧵 线程数: {MAX_WORKERS}")
 print("=" * 60)
 
 # 统计信息
 success_count = 0
 failed_count = 0
+already_claimed_count = 0
 results = []
+
+# 线程锁，用于保护共享变量
+stats_lock = threading.Lock()
+results_lock = threading.Lock()
+print_lock = threading.Lock()
+
+def thread_print(msg):
+    """线程安全的打印函数"""
+    with print_lock:
+        print(msg)
+
+def get_proxy_ip(silent=False):
+    """从API获取代理IP"""
+    if not PROXY_API:
+        if not silent:
+            thread_print("⚠️ 未配置 PROXY_API，将不使用代理")
+        return None
+    
+    try:
+        response = requests.get(PROXY_API, timeout=10)
+        if response.status_code == 200:
+            proxy_str = response.text.strip()
+            if not silent:
+                thread_print(f"🌐 获取到代理IP: {proxy_str}")
+            # 返回格式: 38.55.17.118:54055
+            return {
+                'http': f'http://{proxy_str}',
+                'https': f'http://{proxy_str}'
+            }
+        else:
+            if not silent:
+                thread_print(f"⚠️ 获取代理IP失败，状态码: {response.status_code}")
+            return None
+    except Exception as e:
+        if not silent:
+            thread_print(f"⚠️ 获取代理IP异常: {str(e)}")
+        return None
 
 def get_captcha_token():
     """获取验证码token"""
@@ -59,7 +102,7 @@ def get_captcha_token():
     ret = cracker.crack()
     return ret.get('token')
 
-def claim_faucet(wallet_address, captcha_token):
+def claim_faucet(wallet_address, captcha_token, proxies=None):
     """领取水龙头"""
     url = "https://faucet.iopn.tech/api/faucet/claim"
     
@@ -84,14 +127,15 @@ def claim_faucet(wallet_address, captcha_token):
         "captchaToken": captcha_token
     }
     
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=30)
     return response
 
-# 遍历所有钱包地址
-for idx, wallet_info in enumerate(wallet_addresses, 1):
+def process_wallet(idx, wallet_info, total):
+    """处理单个钱包的领取任务"""
+    global success_count, failed_count, already_claimed_count
+    
     wallet_address = wallet_info['address']
-    print(f"\n[{idx}/{len(wallet_addresses)}] 处理钱包: {wallet_address}")
-    print("-" * 60)
+    thread_print(f"\n[{idx}/{total}] 🚀 开始处理: {wallet_address}")
     
     max_retries = 3
     claim_success = False
@@ -99,82 +143,139 @@ for idx, wallet_info in enumerate(wallet_addresses, 1):
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
-                print(f"\n🔄 第 {attempt} 次重试...")
+                thread_print(f"[{idx}/{total}] 🔄 第 {attempt} 次重试...")
                 time.sleep(2)  # 重试前等待2秒
             
+            # 获取代理IP
+            thread_print(f"[{idx}/{total}] 🔄 获取代理IP...")
+            proxies = get_proxy_ip(silent=True)
+            if proxies:
+                thread_print(f"[{idx}/{total}] ✅ 代理IP设置成功")
+            else:
+                thread_print(f"[{idx}/{total}] ⚠️  将直接连接")
+            
             # 获取验证码
-            print("🔄 获取验证码...")
+            thread_print(f"[{idx}/{total}] 🔄 获取验证码...")
             captcha_token = get_captcha_token()
-            print(f"✅ 验证码获取成功: {captcha_token[:50]}...")
+            thread_print(f"[{idx}/{total}] ✅ 验证码获取成功")
             
             # 领取水龙头
-            print("🔄 发送领取请求...")
-            response = claim_faucet(wallet_address, captcha_token)
+            thread_print(f"[{idx}/{total}] 🔄 发送领取请求...")
+            response = claim_faucet(wallet_address, captcha_token, proxies)
             
-            print(f"📊 响应状态码: {response.status_code}")
+            thread_print(f"[{idx}/{total}] 📊 响应状态码: {response.status_code}")
             
             if response.status_code == 200:
                 result = response.json()
-                print("✅ 领取成功!")
-                print(f"📝 响应内容: {json.dumps(result, ensure_ascii=False)}")
-                success_count += 1
-                results.append({
-                    "address": wallet_address,
-                    "private_key": wallet_info['private_key'],
-                    "status": "success",
-                    "attempts": attempt,
-                    "response": result
-                })
-                claim_success = True
-                break  # 成功后跳出重试循环
-            else:
-                print(f"❌ 领取失败! 状态码: {response.status_code}")
-                print(f"📝 响应内容: {response.text}")
+                thread_print(f"[{idx}/{total}] ✅ 领取成功! {wallet_address}")
                 
-                # 如果还有重试机会，不记录失败
-                if attempt < max_retries:
-                    print(f"⏳ 将在 {max_retries - attempt} 次机会中重试...")
-                else:
-                    print(f"❌ 已达到最大重试次数 ({max_retries} 次)，放弃该地址")
-                    failed_count += 1
+                with stats_lock:
+                    success_count += 1
+                with results_lock:
                     results.append({
                         "address": wallet_address,
                         "private_key": wallet_info['private_key'],
-                        "status": "failed",
+                        "status": "success",
                         "attempts": attempt,
-                        "response": response.text
+                        "response": result
                     })
+                claim_success = True
+                break  # 成功后跳出重试循环
+            else:
+                thread_print(f"[{idx}/{total}] ❌ 领取失败! 状态码: {response.status_code}")
+                thread_print(f"[{idx}/{total}] 📝 响应内容: {response.text}")
+                
+                # 检查是否是已经领取过的错误
+                if "This address has already claimed recently" in response.text:
+                    thread_print(f"[{idx}/{total}] ⏭️  该地址最近已经领取过，跳过重试")
+                    
+                    with stats_lock:
+                        already_claimed_count += 1
+                    with results_lock:
+                        results.append({
+                            "address": wallet_address,
+                            "private_key": wallet_info['private_key'],
+                            "status": "already_claimed",
+                            "attempts": attempt,
+                            "response": response.text
+                        })
+                    claim_success = True  # 标记为已处理，跳出重试循环
+                    break
+                
+                # 如果还有重试机会，不记录失败
+                if attempt < max_retries:
+                    thread_print(f"[{idx}/{total}] ⏳ 将重试...")
+                else:
+                    thread_print(f"[{idx}/{total}] ❌ 已达到最大重试次数，放弃该地址")
+                    
+                    with stats_lock:
+                        failed_count += 1
+                    with results_lock:
+                        results.append({
+                            "address": wallet_address,
+                            "private_key": wallet_info['private_key'],
+                            "status": "failed",
+                            "attempts": attempt,
+                            "response": response.text
+                        })
                 
         except Exception as e:
-            print(f"❌ 请求异常: {str(e)}")
+            thread_print(f"[{idx}/{total}] ❌ 请求异常: {str(e)}")
             
             # 如果还有重试机会，不记录失败
             if attempt < max_retries:
-                print(f"⏳ 将在 {max_retries - attempt} 次机会中重试...")
+                thread_print(f"[{idx}/{total}] ⏳ 将重试...")
             else:
-                print(f"❌ 已达到最大重试次数 ({max_retries} 次)，放弃该地址")
-                failed_count += 1
-                results.append({
-                    "address": wallet_address,
-                    "private_key": wallet_info['private_key'],
-                    "status": "error",
-                    "attempts": attempt,
-                    "error": str(e)
-                })
+                thread_print(f"[{idx}/{total}] ❌ 已达到最大重试次数，放弃该地址")
+                
+                with stats_lock:
+                    failed_count += 1
+                with results_lock:
+                    results.append({
+                        "address": wallet_address,
+                        "private_key": wallet_info['private_key'],
+                        "status": "error",
+                        "attempts": attempt,
+                        "error": str(e)
+                    })
     
-    # 如果不是最后一个地址，等待一段时间避免请求过快
-    if idx < len(wallet_addresses):
-        wait_time = 3
-        print(f"\n⏳ 等待 {wait_time} 秒后处理下一个地址...")
-        time.sleep(wait_time)
+    return wallet_address
+
+# 使用线程池处理所有钱包
+print("\n🚀 开始批量处理钱包...")
+start_time = time.time()
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # 提交所有任务
+    futures = {
+        executor.submit(process_wallet, idx, wallet_info, len(wallet_addresses)): (idx, wallet_info) 
+        for idx, wallet_info in enumerate(wallet_addresses, 1)
+    }
+    
+    # 等待所有任务完成
+    completed = 0
+    for future in as_completed(futures):
+        completed += 1
+        try:
+            wallet_address = future.result()
+            thread_print(f"\n✅ 进度: {completed}/{len(wallet_addresses)} 已完成")
+        except Exception as e:
+            thread_print(f"\n❌ 任务执行异常: {str(e)}")
+
+end_time = time.time()
+elapsed_time = end_time - start_time
 
 # 输出统计信息
 print("\n" + "=" * 60)
 print("📊 执行完成！统计信息：")
 print("=" * 60)
 print(f"✅ 成功: {success_count} 个")
+print(f"⏭️  已领取过: {already_claimed_count} 个")
 print(f"❌ 失败: {failed_count} 个")
 print(f"📝 总计: {len(wallet_addresses)} 个")
+print(f"⏱️  总耗时: {elapsed_time:.2f} 秒")
+print(f"🧵 使用线程数: {MAX_WORKERS}")
+print(f"⚡ 平均速度: {elapsed_time/len(wallet_addresses):.2f} 秒/个")
 
 # 保存结果到文件
 result_file = os.path.join(current_dir, 'claim_results.json')
@@ -183,6 +284,7 @@ with open(result_file, 'w', encoding='utf-8') as f:
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(wallet_addresses),
         "success": success_count,
+        "already_claimed": already_claimed_count,
         "failed": failed_count,
         "details": results
     }, f, indent=2, ensure_ascii=False)
